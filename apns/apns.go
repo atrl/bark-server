@@ -35,7 +35,14 @@ func (p PushMessage) IsEmptyAlert() bool {
 
 func (p PushMessage) IsDelete() bool {
 	val := p.ExtParams["delete"]
-	return val == "1" || val == 1 || val == 1.0
+	switch v := val.(type) {
+	case string:
+		return v == "1" || strings.EqualFold(v, "true")
+	case bool:
+		return v
+	default:
+		return val == 1 || val == 1.0
+	}
 }
 
 const (
@@ -144,7 +151,7 @@ func Push(msg *PushMessage) (code int, err error) {
 		return 500, err
 	}
 	if resp.StatusCode != 200 {
-		return resp.StatusCode, fmt.Errorf(resp.Reason)
+		return resp.StatusCode, fmt.Errorf("%s", resp.Reason)
 	}
 	return 200, nil
 }

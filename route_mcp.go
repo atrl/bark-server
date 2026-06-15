@@ -103,6 +103,7 @@ func notifyHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallT
 func getCommonToolOpts() []mcp.ToolOption {
 	return []mcp.ToolOption{
 		mcp.WithDescription("Send a notification to a device via Bark"),
+		mcp.WithString("id", mcp.Description("Notification id used for replacement or delete")),
 		mcp.WithString("title", mcp.Description("Notification title")),
 		mcp.WithString("subtitle", mcp.Description("Notification subtitle")),
 		mcp.WithString("body", mcp.Description("Notification content")),
@@ -119,13 +120,18 @@ func getCommonToolOpts() []mcp.ToolOption {
 		),
 		mcp.WithNumber("badge", mcp.Description("Badge number")),
 		mcp.WithString("call", mcp.Description("Set to '1' to repeat the notification ringtone")),
+		mcp.WithString("autoCopy", mcp.Description("Set to '1' to copy notification text automatically")),
 		mcp.WithString("sound", mcp.Description("Notification sound")),
 		mcp.WithString("icon", mcp.Description("Notification icon URL")),
 		mcp.WithString("image", mcp.Description("Notification image URL")),
 		mcp.WithString("group", mcp.Description("Notification group")),
+		mcp.WithString("ciphertext", mcp.Description("Encrypted push payload ciphertext")),
+		mcp.WithString("iv", mcp.Description("Initialization vector for encrypted push payloads")),
 		mcp.WithString("isArchive", mcp.Description("Set to '1' to save the notification or any other value to skip saving")),
 		mcp.WithNumber("ttl", mcp.Description("Time to live in seconds for archived messages; expired items are automatically deleted")),
 		mcp.WithString("url", mcp.Description("Click action URL")),
+		mcp.WithString("action", mcp.Description("Tap action, for example 'none' to disable notification tap")),
 		mcp.WithString("copy", mcp.Description("Text to copy on copy action")),
+		mcp.WithString("delete", mcp.Description("Set to '1' with id to delete a delivered notification")),
 	}
 }

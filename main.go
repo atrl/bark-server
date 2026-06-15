@@ -101,6 +101,7 @@ func setupRouter(c *cli.Context, fiberApp *fiber.App) {
 func initializeDatabase(c *cli.Context) {
 	if c.Bool("serverless") {
 		db = database.NewEnvBase()
+		androidHub = newAndroidDeliveryHub()
 		return
 	}
 
@@ -117,10 +118,17 @@ func initializeDatabase(c *cli.Context) {
 		} else {
 			db = database.NewMySQL(dsn)
 		}
+		if err := initializeAndroidDelivery(c.String("data")); err != nil {
+			logger.Fatalf("failed to initialize android delivery storage: %v", err)
+		}
 		return
 	}
 
-	db = database.NewBboltdb(c.String("data"))
+	dataDir := c.String("data")
+	db = database.NewBboltdb(dataDir)
+	if err := initializeAndroidDelivery(dataDir); err != nil {
+		logger.Fatalf("failed to initialize android delivery storage: %v", err)
+	}
 }
 
 func setupGracefulShutdown(fiberApp *fiber.App) {

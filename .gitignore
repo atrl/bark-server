@@ -12,6 +12,11 @@
 *.out
 
 bark-server
+bark-server-local
+bark-server.local*.log
+bark-server.local.pid
+bark-data-local/
+com.rziiiii.bark-server.plist
 dist
 .idea/
 .vscode/

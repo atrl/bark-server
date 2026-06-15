@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -15,16 +16,13 @@ import (
 
 // Before running the tests, a valid deviceToken must be set. Otherwise, the tests will fail.
 const (
-	deviceToken = ""
+	deviceToken = "android:test-device"
 	key         = "MemoryBaseKey"
 )
 
 var app *fiber.App
 
 func TestMain(m *testing.M) {
-	if deviceToken == "" {
-		panic("deviceToken is not set")
-	}
 	db = database.NewMemBase()
 	db.SaveDeviceTokenByKey(key, deviceToken)
 	app = NewServer()
@@ -264,6 +262,193 @@ func TestBatchPush(t *testing.T) {
 	})
 }
 
+func TestAndroidPushCanBePolled(t *testing.T) {
+	androidHub = newAndroidDeliveryHub()
+
+	registerBody := `{"device_key":"` + key + `","device_token":"android:emulator-1"}`
+	req, _ := http.NewRequest("POST", "/register", bytes.NewBufferString(registerBody))
+	req.Host = "example.com"
+	req.Header.Set("Content-Type", "application/json")
+	res, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("register: want 200, got %d, res: %s", res.StatusCode, string(body))
+	}
+
+	var registerResp CommonResp
+	if err := jsoniter.NewDecoder(res.Body).Decode(&registerResp); err != nil {
+		t.Fatal(err)
+	}
+	data, ok := registerResp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("register: unexpected data shape %#v", registerResp.Data)
+	}
+	deviceKey, ok := data["device_key"].(string)
+	if !ok || deviceKey == "" {
+		t.Fatalf("register: missing device_key in %#v", data)
+	}
+
+	pushBody := `{"device_key":"` + deviceKey + `","title":"Android title","subtitle":"Android subtitle","body":"Android body","group":"android","url":"https://day.app","sound":"bell","badge":3}`
+	req, _ = http.NewRequest("POST", "/push", bytes.NewBufferString(pushBody))
+	req.Host = "example.com"
+	req.Header.Set("Content-Type", "application/json")
+	res, err = app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("push: want 200, got %d, res: %s", res.StatusCode, string(body))
+	}
+
+	req, _ = http.NewRequest("GET", "/android/poll/"+deviceKey+"?timeout=1", nil)
+	req.Host = "example.com"
+	res, err = app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("poll: want 200, got %d, res: %s", res.StatusCode, string(body))
+	}
+
+	var pollResp CommonResp
+	if err := jsoniter.NewDecoder(res.Body).Decode(&pollResp); err != nil {
+		t.Fatal(err)
+	}
+	payload, ok := pollResp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("poll: unexpected data shape %#v", pollResp.Data)
+	}
+	for field, want := range map[string]string{
+		"title":    "Android title",
+		"subtitle": "Android subtitle",
+		"body":     "Android body",
+		"group":    "android",
+		"url":      "https://day.app",
+		"sound":    "bell.caf",
+	} {
+		if got := payload[field]; got != want {
+			t.Fatalf("poll: field %s want %q, got %#v in %#v", field, want, got, payload)
+		}
+	}
+	if got := payload["badge"]; got != "3" {
+		t.Fatalf("poll: badge want string 3, got %#v in %#v", got, payload)
+	}
+}
+
+func TestAndroidBatchPushCanBePolledByEachDevice(t *testing.T) {
+	androidHub = newAndroidDeliveryHub()
+
+	previousDB := db
+	db = testDeviceDatabase{
+		"AndroidBatchKeyOne": "android:batch-device-1",
+		"AndroidBatchKeyTwo": "android:batch-device-2",
+	}
+	defer func() { db = previousDB }()
+
+	deviceKeyOne := "AndroidBatchKeyOne"
+	deviceKeyTwo := "AndroidBatchKeyTwo"
+
+	pushBody := `{"device_keys":["` + deviceKeyOne + `","` + deviceKeyTwo + `"],"title":"Android batch","body":"Batch body","group":"batch"}`
+	req, _ := http.NewRequest("POST", "/push", bytes.NewBufferString(pushBody))
+	req.Host = "example.com"
+	req.Header.Set("Content-Type", "application/json")
+	res, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("batch push: want 200, got %d, res: %s", res.StatusCode, string(body))
+	}
+
+	var batchResp CommonResp
+	if err := jsoniter.NewDecoder(res.Body).Decode(&batchResp); err != nil {
+		t.Fatal(err)
+	}
+	results, ok := batchResp.Data.([]interface{})
+	if !ok || len(results) != 2 {
+		t.Fatalf("batch push: unexpected data shape %#v", batchResp.Data)
+	}
+	for index, result := range results {
+		item, ok := result.(map[string]interface{})
+		if !ok {
+			t.Fatalf("batch push: result %d has unexpected shape %#v", index, result)
+		}
+		if got := item["code"]; got != float64(200) {
+			t.Fatalf("batch push: result %d code want 200, got %#v in %#v", index, got, item)
+		}
+	}
+
+	for _, deviceKey := range []string{deviceKeyOne, deviceKeyTwo} {
+		req, _ = http.NewRequest("GET", "/android/poll/"+deviceKey+"?timeout=1", nil)
+		req.Host = "example.com"
+		res, err = app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != 200 {
+			body, _ := io.ReadAll(res.Body)
+			t.Fatalf("poll %s: want 200, got %d, res: %s", deviceKey, res.StatusCode, string(body))
+		}
+
+		var pollResp CommonResp
+		if err := jsoniter.NewDecoder(res.Body).Decode(&pollResp); err != nil {
+			t.Fatal(err)
+		}
+		payload, ok := pollResp.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("poll %s: unexpected data shape %#v", deviceKey, pollResp.Data)
+		}
+		for field, want := range map[string]string{
+			"title": "Android batch",
+			"body":  "Batch body",
+			"group": "batch",
+		} {
+			if got := payload[field]; got != want {
+				t.Fatalf("poll %s: field %s want %q, got %#v in %#v", deviceKey, field, want, got, payload)
+			}
+		}
+	}
+}
+
+type testDeviceDatabase map[string]string
+
+func (d testDeviceDatabase) CountAll() (int, error) {
+	return len(d), nil
+}
+
+func (d testDeviceDatabase) DeviceTokenByKey(key string) (string, error) {
+	token, ok := d[key]
+	if !ok || token == "" {
+		return "", fmt.Errorf("key not found")
+	}
+	return token, nil
+}
+
+func (d testDeviceDatabase) SaveDeviceTokenByKey(key, token string) (string, error) {
+	d[key] = token
+	return key, nil
+}
+
+func (d testDeviceDatabase) DeleteDeviceByKey(key string) error {
+	delete(d, key)
+	return nil
+}
+
+func (d testDeviceDatabase) Close() error {
+	return nil
+}
+
 type APITestCase struct {
 	Name           string
 	Method         string
@@ -297,6 +482,7 @@ func Endpoint(t *testing.T, tc []APITestCase) {
 	for _, tt := range tc {
 		t.Run(tt.Name, func(t *testing.T) {
 			req, _ := http.NewRequest(tt.Method, tt.URL, bytes.NewBufferString(tt.Body))
+			req.Host = "example.com"
 			if tt.IsJson {
 				req.Header.Set("Content-Type", "application/json")
 			} else {

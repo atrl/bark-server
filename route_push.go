@@ -209,7 +209,7 @@ func push(params map[string]interface{}) (int, error) {
 	// default value
 	msg := apns.PushMessage{
 		Body:      "",
-		Sound:     "1107",
+		Sound:     defaultApnsSound,
 		ExtParams: make(map[string]interface{}),
 	}
 
@@ -262,6 +262,12 @@ func push(params map[string]interface{}) (int, error) {
 	}
 
 	msg.DeviceToken = deviceToken
+	if isAndroidDeviceToken(deviceToken) {
+		if err := deliverAndroidPush(&msg); err != nil {
+			return 500, fmt.Errorf("android push failed: %v", err)
+		}
+		return 200, nil
+	}
 
 	code, err := apns.Push(&msg)
 
