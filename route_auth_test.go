@@ -7,7 +7,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-func TestRouterAuthDoesNotInterceptDeviceKeyRoutes(t *testing.T) {
+func TestRouterAuthRequiresAndroidPollCredentials(t *testing.T) {
 	app := fiber.New()
 	routerAuth("bark-user", "bark-pass", app, "")
 	app.Get("/android/poll/:device_key", func(c *fiber.Ctx) error {
@@ -24,8 +24,20 @@ func TestRouterAuthDoesNotInterceptDeviceKeyRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
+	if res.StatusCode != fiber.StatusTeapot {
+		t.Fatalf("android poll should require auth: want %d, got %d", fiber.StatusTeapot, res.StatusCode)
+	}
+
+	req, _ = http.NewRequest("GET", "/android/poll/android-key", nil)
+	req.Host = "example.com"
+	req.SetBasicAuth("bark-user", "bark-pass")
+	res, err = app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
 	if res.StatusCode != fiber.StatusNoContent {
-		t.Fatalf("android poll should be guarded by its device key handler, not Basic Auth: want %d, got %d", fiber.StatusNoContent, res.StatusCode)
+		t.Fatalf("android poll with credentials should pass: want %d, got %d", fiber.StatusNoContent, res.StatusCode)
 	}
 
 	req, _ = http.NewRequest("POST", "/push", nil)
@@ -35,7 +47,7 @@ func TestRouterAuthDoesNotInterceptDeviceKeyRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != fiber.StatusOK {
-		t.Fatalf("push route should be guarded by its device key handler, not Basic Auth: want %d, got %d", fiber.StatusOK, res.StatusCode)
+	if res.StatusCode != fiber.StatusTeapot {
+		t.Fatalf("push route should still require auth: want %d, got %d", fiber.StatusTeapot, res.StatusCode)
 	}
 }
