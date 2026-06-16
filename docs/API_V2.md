@@ -201,7 +201,7 @@ public class SendRequest
     };
     httpOptions.headers['User-Agent'] = 'node ' + process.version;
  
-    // Using Basic Auth {"username":"","password":""}
+    // Access is scoped by device_key; Basic Auth is not required.
     // Paw Store Cookies option is not supported
 
     const request = httpTransport.request(httpOptions, (res) => {

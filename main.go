@@ -272,13 +272,13 @@ func getAppFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:    "user",
-			Usage:   "Basic auth username",
+			Usage:   "Deprecated no-op; push and Android polling routes are guarded by device_key",
 			EnvVars: []string{"BARK_SERVER_BASIC_AUTH_USER"},
 			Value:   "",
 		},
 		&cli.StringFlag{
 			Name:    "password",
-			Usage:   "Basic auth password",
+			Usage:   "Deprecated no-op; push and Android polling routes are guarded by device_key",
 			EnvVars: []string{"BARK_SERVER_BASIC_AUTH_PASSWORD"},
 			Value:   "",
 		},

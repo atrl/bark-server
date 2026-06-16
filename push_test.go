@@ -421,6 +421,52 @@ func TestAndroidBatchPushCanBePolledByEachDevice(t *testing.T) {
 	}
 }
 
+func TestPushRejectsUnknownDeviceKey(t *testing.T) {
+	req, _ := http.NewRequest("POST", "/push", bytes.NewBufferString(`{"device_key":"missing-key","body":"blocked"}`))
+	req.Host = "example.com"
+	req.Header.Set("Content-Type", "application/json")
+	res, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 400 {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("push with unknown device_key: want 400, got %d, res: %s", res.StatusCode, string(body))
+	}
+}
+
+func TestAndroidPollRequiresRegisteredAndroidDeviceKey(t *testing.T) {
+	previousDB := db
+	db = testDeviceDatabase{
+		"ios-key":     "ios-device-token",
+		"android-key": "android:poll-device",
+	}
+	defer func() { db = previousDB }()
+
+	for _, tc := range []struct {
+		name string
+		url  string
+	}{
+		{name: "unknown key", url: "/android/poll/missing-key?timeout=1"},
+		{name: "non android key", url: "/android/poll/ios-key?timeout=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", tc.url, nil)
+			req.Host = "example.com"
+			res, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != 400 {
+				body, _ := io.ReadAll(res.Body)
+				t.Fatalf("%s: want 400, got %d, res: %s", tc.name, res.StatusCode, string(body))
+			}
+		})
+	}
+}
+
 type testDeviceDatabase map[string]string
 
 func (d testDeviceDatabase) CountAll() (int, error) {
