@@ -126,7 +126,7 @@ class ReleasePublicationTests(unittest.TestCase):
         apk.write_bytes(b"fixture APK")
         results = [
             types.SimpleNamespace(stdout="package: name='day.bark.android' versionCode='4' versionName='0.2.1'\nsdkVersion:'26'\n"),
-            types.SimpleNamespace(stdout="Signer #1 certificate SHA-256 digest: " + release.SIGNING_CERTIFICATE_SHA256 + "\n"),
+            types.SimpleNamespace(stdout="Number of signers: 1\nSigner #1 certificate SHA-256 digest: " + release.SIGNING_CERTIFICATE_SHA256 + "\n"),
         ]
         args = types.SimpleNamespace(apk=apk, output_dir=self.root / "prepared", release_notes_file=None,
                                      aapt="aapt", apksigner="apksigner")
@@ -144,10 +144,48 @@ class ReleasePublicationTests(unittest.TestCase):
         apk = self.root / "input.apk"
         apk.write_bytes(b"fixture APK")
         results = [types.SimpleNamespace(stdout="package: name='day.bark.android' versionCode='4' versionName='0.2.1'\nsdkVersion:'26'\n"),
-                   types.SimpleNamespace(stdout="Signer #1 certificate SHA-256 digest: " + "0" * 64 + "\n")]
+                   types.SimpleNamespace(stdout="Number of signers: 1\nSigner #1 certificate SHA-256 digest: " + "0" * 64 + "\n")]
         with mock.patch.object(release.subprocess, "run", side_effect=results):
             with self.assertRaisesRegex(ValueError, "Actual APK signer"):
                 release.apk_metadata(apk, "aapt", "apksigner")
+
+
+    def test_sdk_scoped_same_certificate_is_one_pinned_signer(self):
+        pin = release.SIGNING_CERTIFICATE_SHA256
+        output = ("Number of signers: 1\n"
+                  "Signer (minSdkVersion=33, maxSdkVersion=2147483647) certificate SHA-256 digest: " + pin + "\n"
+                  "Signer (minSdkVersion=28, maxSdkVersion=32) certificate SHA-256 digest: " + pin + "\n")
+        self.assertEqual(pin, release.verified_signing_certificate(output))
+        self.assertEqual(pin, release.verified_signing_certificate(
+            output.replace("minSdkVersion=33,", "minSdkVersion=33 (dev release=true),")))
+
+    def test_sdk_scoped_different_certificate_is_rejected(self):
+        output = ("Number of signers: 1\n"
+                  "Signer (minSdkVersion=33, maxSdkVersion=2147483647) certificate SHA-256 digest: " + release.SIGNING_CERTIFICATE_SHA256 + "\n"
+                  "Signer (minSdkVersion=28, maxSdkVersion=32) certificate SHA-256 digest: " + "0" * 64 + "\n")
+        with self.assertRaisesRegex(ValueError, "Actual APK signer"):
+            release.verified_signing_certificate(output)
+
+    def test_multiple_current_signers_or_second_numbered_signer_are_rejected(self):
+        certificate = "Signer #1 certificate SHA-256 digest: " + release.SIGNING_CERTIFICATE_SHA256 + "\n"
+        for output in (
+            "Number of signers: 2\n" + certificate,
+            "Number of signers: 1\nNumber of signers: 1\n" + certificate,
+            "Number of signers: 1\n" + certificate + certificate.replace("#1", "#2"),
+            "Number of signers: 1\n" + certificate.replace("#1", "#2"),
+        ):
+            with self.subTest(output=output):
+                with self.assertRaises(ValueError):
+                    release.verified_signing_certificate(output)
+
+    def test_unknown_signer_output_is_rejected(self):
+        for label in ("Signer current", "Signer #1 in lineage", "Signer (minSdkVersion=33, maxSdkVersion=28)"):
+            output = "Number of signers: 1\n" + label + " certificate SHA-256 digest: " + release.SIGNING_CERTIFICATE_SHA256 + "\n"
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    release.verified_signing_certificate(output)
+        with self.assertRaises(ValueError):
+            release.verified_signing_certificate("Number of signers: 1\n")
 
 
 if __name__ == "__main__":

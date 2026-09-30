@@ -190,6 +190,44 @@ def sdk_tool(name, explicit=None):
     raise ValueError(f"Set --{name} or ANDROID_HOME to a verified Android SDK")
 
 
+
+def verified_signing_certificate(output):
+    """Accept one pinned signer, including apksigner's official v3.1 SDK labels.
+
+    ApkSignerTool prints SDK-scoped v3.1/v3.0 certificates instead of numbered
+    signers when v3.1 is present. The single-current-signer summary and every
+    printed SDK certificate must agree with the existing application pin.
+    """
+    summaries = [line for line in output.splitlines() if line.startswith("Number of signers:")]
+    require(len(summaries) == 1 and summaries[0] == "Number of signers: 1",
+            "APK must report exactly one current signer")
+    records = [line for line in output.splitlines()
+               if line.startswith("Signer") and "certificate SHA-256 digest" in line]
+    require(records, "APK signer certificate records are missing or unrecognized")
+    labels = set()
+    for record in records:
+        numbered = re.fullmatch(r"Signer #(\d+) certificate SHA-256 digest: ([0-9a-fA-F]{64})", record)
+        scoped = re.fullmatch(
+            r"Signer \(minSdkVersion=(\d+)(?: \(dev release=true\))?, maxSdkVersion=(\d+)\) "
+            r"certificate SHA-256 digest: ([0-9a-fA-F]{64})", record)
+        if numbered:
+            require(numbered[1] == "1" and len(records) == 1,
+                    "APK must contain exactly one numbered signer certificate")
+            labels.add("numbered")
+            certificate = numbered[2].lower()
+        elif scoped:
+            require(1 <= int(scoped[1]) <= int(scoped[2]) <= 2147483647,
+                    "APK signer SDK interval is invalid")
+            labels.add("scoped")
+            certificate = scoped[3].lower()
+        else:
+            raise ValueError("APK signer certificate output format is unrecognized")
+        require(certificate == SIGNING_CERTIFICATE_SHA256,
+                "Actual APK signer differs from the existing application's certificate")
+    require(len(labels) == 1, "APK signer certificate output mixes incompatible formats")
+    return SIGNING_CERTIFICATE_SHA256
+
+
 def apk_metadata(apk, aapt, apksigner):
     with regular_file(apk):
         pass
@@ -200,10 +238,7 @@ def apk_metadata(apk, aapt, apksigner):
     require(package and minimum, "Unable to read package/version/minimum SDK from actual APK")
     verified = subprocess.run([apksigner, "verify", "--verbose", "--print-certs", str(apk)],
                               check=True, capture_output=True, text=True, timeout=60).stdout
-    certificates = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]{64})$", verified, re.M)
-    require(len(certificates) == 1, "APK must have exactly one current signer")
-    certificate = certificates[0].lower()
-    require(certificate == SIGNING_CERTIFICATE_SHA256, "Actual APK signer differs from the existing application's certificate")
+    certificate = verified_signing_certificate(verified)
     return {"package_name": package[1], "version_code": int(package[2]),
             "version_name": package[3], "min_sdk": int(minimum[1]),
             "signing_certificate_sha256": certificate}
