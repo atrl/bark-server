@@ -1,0 +1,7 @@
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /etc/cloudflared/credentials.json
+metrics: 127.0.0.1:18084
+ingress:
+  - hostname: bark.example.com
+    service: http://127.0.0.1:18083
+  - service: http_status:404

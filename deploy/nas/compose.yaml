@@ -1,0 +1,87 @@
+name: bark
+services:
+  server:
+    image: ${BARK_IMAGE:?Set BARK_IMAGE to the verified release image}
+    container_name: bark-server
+    restart: always
+    network_mode: host
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpu_shares: 256
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=16m,uid=65532,gid=65532,mode=0700
+    environment:
+      BARK_SERVER_ADDRESS: 127.0.0.1:18083
+      BARK_SERVER_DATA_DIR: /data
+      BARK_PUBLIC_URL: ${BARK_PUBLIC_URL:?Set the public HTTPS URL}
+      BARK_FCM_PROJECT_ID: ${BARK_FCM_PROJECT_ID:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${BARK_FCM_CREDENTIALS_PATH:-}
+      BARK_ANDROID_QUEUE_LIMIT: ${BARK_ANDROID_QUEUE_LIMIT:-1024}
+      BARK_ANDROID_QUEUE_MAX_BYTES: ${BARK_ANDROID_QUEUE_MAX_BYTES:-4194304}
+      BARK_ANDROID_MESSAGE_MAX_BYTES: ${BARK_ANDROID_MESSAGE_MAX_BYTES:-32768}
+      HTTPS_PROXY: ${BARK_HTTPS_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets:ro
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:18083/healthz]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
+
+  tunnel:
+    image: cloudflare/cloudflared:2026.8.1
+    container_name: bark-cloudflared
+    restart: always
+    network_mode: host
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpu_shares: 128
+    pids_limit: 64
+    command: [tunnel, --config, /etc/cloudflared/config.yml, --no-autoupdate, run]
+    volumes:
+      - ./cloudflare:/etc/cloudflared:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
+
+  egress:
+    # Optional NAS-only outbound route for Google's FCM and OAuth endpoints.
+    profiles: [google-egress]
+    image: dreamacro/clash-premium@sha256:4026803353b7c0341366225db3398cf803efba21488180211ec65ad588ce5933
+    container_name: bark-egress
+    restart: always
+    network_mode: host
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpu_shares: 128
+    command: [-d, /config]
+    volumes:
+      - ./egress:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
