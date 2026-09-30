@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,13 +15,14 @@ import (
 
 // Both stores apply changes transactionally: errors leave the previous state.
 type memoryAndroidDeliveryStore struct {
-	limit int
-	mu    sync.Mutex
-	boxes map[string][]byte
+	limit    int
+	maxBytes int
+	mu       sync.Mutex
+	boxes    map[string][]byte
 }
 
 func newMemoryAndroidDeliveryStore(limit int) *memoryAndroidDeliveryStore {
-	return &memoryAndroidDeliveryStore{limit: limit, boxes: make(map[string][]byte)}
+	return &memoryAndroidDeliveryStore{limit: limit, maxBytes: defaultAndroidQueueBytes, boxes: make(map[string][]byte)}
 }
 
 func decodeAndroidOutbox(key string, raw []byte) (androidDeviceOutbox, error) {
@@ -72,6 +74,9 @@ func (s *memoryAndroidDeliveryStore) update(key string, change func(*androidDevi
 	if err != nil {
 		return err
 	}
+	if len(raw) > s.maxBytes && len(box.Messages) > previousCount {
+		return errAndroidQueueFull
+	}
 	s.boxes[key] = raw
 	return nil
 }
@@ -87,20 +92,21 @@ func (s *memoryAndroidDeliveryStore) deviceKeys() ([]string, error) {
 }
 
 type fileAndroidDeliveryStore struct {
-	dir   string
-	limit int
-	mu    sync.Mutex
+	dir      string
+	limit    int
+	maxBytes int
+	mu       sync.Mutex
 }
 
 func newFileAndroidDeliveryStore(dir string, limit int) (*fileAndroidDeliveryStore, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	return &fileAndroidDeliveryStore{dir: dir, limit: limit}, nil
+	return &fileAndroidDeliveryStore{dir: dir, limit: limit, maxBytes: defaultAndroidQueueBytes}, nil
 }
 
 func (s *fileAndroidDeliveryStore) readUnlocked(key string) (androidDeviceOutbox, error) {
-	raw, err := os.ReadFile(s.queueFile(key))
+	raw, err := readAndroidOutboxFile(s.queueFile(key))
 	if err != nil && !os.IsNotExist(err) {
 		return androidDeviceOutbox{}, err
 	}
@@ -130,6 +136,9 @@ func (s *fileAndroidDeliveryStore) update(key string, change func(*androidDevice
 	raw, err := json.Marshal(box)
 	if err != nil {
 		return err
+	}
+	if len(raw) > s.maxBytes && len(box.Messages) > previousCount {
+		return errAndroidQueueFull
 	}
 	file, err := os.CreateTemp(s.dir, ".outbox-*")
 	if err != nil {
@@ -170,7 +179,7 @@ func (s *fileAndroidDeliveryStore) deviceKeys() ([]string, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(s.dir, entry.Name()))
+		raw, err := readAndroidOutboxFile(filepath.Join(s.dir, entry.Name()))
 		if err != nil {
 			return nil, err
 		}
@@ -192,4 +201,30 @@ func (s *fileAndroidDeliveryStore) deviceKeys() ([]string, error) {
 func (s *fileAndroidDeliveryStore) queueFile(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return filepath.Join(s.dir, hex.EncodeToString(sum[:])+".json")
+}
+
+// A corrupt/old oversized file is retained for repair, never read unboundedly or
+// truncated. The configured append limit leaves room for delivery metadata.
+func readAndroidOutboxFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxAndroidOutboxFileBytes {
+		return nil, fmt.Errorf("Android outbox exceeds the safe read limit; file retained for repair")
+	}
+	raw := make([]byte, info.Size())
+	if _, err := io.ReadFull(file, raw); err != nil {
+		return nil, err
+	}
+	var extra [1]byte
+	if n, err := file.Read(extra[:]); n != 0 || (err != nil && err != io.EOF) {
+		return nil, fmt.Errorf("Android outbox changed while reading; retry without modifying the file")
+	}
+	return raw, nil
 }

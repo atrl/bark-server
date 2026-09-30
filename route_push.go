@@ -265,6 +265,9 @@ func push(params map[string]interface{}) (int, error) {
 	msg.DeviceToken = deviceToken
 	if isAndroidDeviceToken(deviceToken) {
 		if err := deliverAndroidPush(&msg); err != nil {
+			if errors.Is(err, errAndroidMessageTooLarge) {
+				return 413, err
+			}
 			if errors.Is(err, errAndroidQueueFull) {
 				return 503, err
 			}

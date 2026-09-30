@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,6 +71,25 @@ func newHTTPFCMSender(project, publicURL string, credentials []byte, client *htt
 	config, err := google.JWTConfigFromJSON(credentials, fcmScope)
 	if err != nil || config.Email == "" || len(config.PrivateKey) == 0 {
 		return nil, fmt.Errorf("GOOGLE_APPLICATION_CREDENTIALS must contain a service account private key")
+	}
+	block, _ := pem.Decode(config.PrivateKey)
+	if block == nil {
+		return nil, fmt.Errorf("service account private key is not valid PEM")
+	}
+	signingKey, parseErr := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if parseErr != nil {
+		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("service account private key cannot be parsed")
+		}
+		var ok bool
+		signingKey, ok = parsed.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("service account private key must be RSA")
+		}
+	}
+	if err := signingKey.Validate(); err != nil {
+		return nil, fmt.Errorf("service account private key is invalid")
 	}
 	// Only send signed assertions to Google's OAuth endpoint, never a URL supplied
 	// by an inbound request or a credential file with an unexpected token_uri.

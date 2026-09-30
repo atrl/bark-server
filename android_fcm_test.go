@@ -224,3 +224,21 @@ type staticFCMToken struct{}
 func (staticFCMToken) Token() (*oauth2.Token, error) {
 	return &oauth2.Token{AccessToken: "mock", TokenType: "Bearer"}, nil
 }
+
+func TestFCMConfigurationRejectsMalformedPrivateKeyAndUnsafeURL(t *testing.T) {
+	badKey := []byte(`{"type":"service_account","client_email":"test@example.com","private_key":"not-a-private-key"}`)
+	if _, err := newHTTPFCMSender("test-project", "https://bark.example", badKey, http.DefaultClient); err == nil {
+		t.Fatal("malformed private key reported configured")
+	}
+	for _, address := range []string{"http://bark.example", "https://user:password@bark.example", "https://bark.example?secret=value", "https://bark.example#fragment"} {
+		if err := validateBarkPublicURL(address); err == nil {
+			t.Fatalf("unsafe URL accepted: %s", address)
+		}
+	}
+	t.Setenv("BARK_FCM_PROJECT_ID", "")
+	t.Setenv("BARK_PUBLIC_URL", "https://bark.example")
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "/does-not-exist")
+	if sender, err := newFCMSenderFromEnvironment(); err != nil || sender != nil {
+		t.Fatal("incomplete FCM setup should leave polling available")
+	}
+}

@@ -151,8 +151,19 @@ migrated on their next mutation. A successful push means **stored by Bark**, and
 Sync does not delete a message. Only authenticated ACK, authorized device deletion,
 or the explicitly legacy destructive poll API can remove it.
 
-Each device has a 1,024-message pending limit. A full outbox rejects a new push
-with HTTP 503 and retains all earlier messages. Transient FCM failures are retried
+The default limits are 1,024 pending messages and 4 MiB of encoded outbox per
+device, with a 32 KiB JSON payload limit per message. Configure
+`BARK_ANDROID_QUEUE_LIMIT` (1–100,000), `BARK_ANDROID_QUEUE_MAX_BYTES`
+(65,536–16,777,216), and `BARK_ANDROID_MESSAGE_MAX_BYTES` (1,024–262,144) to change
+these limits; the per-message limit cannot exceed the queue byte limit. An
+oversized message is rejected with HTTP 413 before persistence. A new delivery
+that would exceed the count or byte capacity is rejected with HTTP 503 while all
+earlier messages remain. Delivery/ACK metadata may add a small amount above the
+append byte limit. Files larger than 32 MiB are refused for reading and retained
+for explicit repair, never truncated. The file store loads one device queue at a
+time, so retain the conservative byte limit on a NAS with a 256 MiB container
+budget; large numbers of concurrently syncing devices still need separate load
+measurement. There is no automatic expiry of unacknowledged messages. Transient FCM failures are retried
 with exponential delay (1 minute up to 64 minutes), honoring a longer
 `Retry-After`. Unregistered FCM tokens are cleared; messages remain available for
 sync. Registering a replacement token unblocks pending deliveries. Provider

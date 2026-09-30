@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ const androidDeviceTokenPrefix = "android:"
 const defaultAndroidQueueLimit = 1024
 const defaultApnsSound = "1107"
 
+var errAndroidMessageTooLarge = errors.New("Android message payload exceeds the configured byte limit")
 var errAndroidQueueFull = errors.New("android outbox is full; receive and acknowledge pending messages before retrying")
 var errAndroidUnauthorized = errors.New("invalid Android device credentials")
 var errAndroidReliableTransport = errors.New("device uses reliable delivery; use authenticated sync and ack")
@@ -35,6 +37,7 @@ type androidDelivery struct {
 	Attempts         int                    `json:"attempts,omitempty"`
 	RetryAtMillis    int64                  `json:"retry_at_millis,omitempty"`
 	FCMBlocked       bool                   `json:"fcm_blocked,omitempty"`
+	Superseded       bool                   `json:"superseded,omitempty"`
 	NotificationMode string                 `json:"-"`
 }
 
@@ -77,12 +80,13 @@ type androidDeliveryHub struct {
 	signals map[string]chan struct{}
 	// Serialize fetching with sending. A short fetch lease prevents sending while
 	// the client persists/ACKs; a lost sync response cannot disable FCM forever.
-	deliveryLocks map[string]*sync.Mutex
-	publicURL     string
-	sender        androidFCMSender
-	wake          chan struct{}
-	cancel        context.CancelFunc
-	done          chan struct{}
+	deliveryLocks   map[string]*sync.Mutex
+	publicURL       string
+	messageMaxBytes int
+	sender          androidFCMSender
+	wake            chan struct{}
+	cancel          context.CancelFunc
+	done            chan struct{}
 }
 
 func newAndroidDeliveryHub(stores ...androidDeliveryStore) *androidDeliveryHub {
@@ -90,7 +94,7 @@ func newAndroidDeliveryHub(stores ...androidDeliveryStore) *androidDeliveryHub {
 	if len(stores) > 0 && stores[0] != nil {
 		store = stores[0]
 	}
-	return &androidDeliveryHub{store: store, signals: make(map[string]chan struct{}), wake: make(chan struct{}, 1), deliveryLocks: make(map[string]*sync.Mutex)}
+	return &androidDeliveryHub{store: store, signals: make(map[string]chan struct{}), wake: make(chan struct{}, 1), deliveryLocks: make(map[string]*sync.Mutex), messageMaxBytes: defaultAndroidMessageBytes}
 }
 
 func isAndroidDeviceToken(token string) bool {
@@ -109,11 +113,17 @@ func pollAndroidPush(deviceKey string, timeout time.Duration) (map[string]interf
 }
 
 func initializeAndroidDelivery(dataDir string) error {
-	store, err := newFileAndroidDeliveryStore(filepath.Join(dataDir, "android-delivery"), defaultAndroidQueueLimit)
+	limits, err := androidDeliveryLimitsFromEnvironment()
 	if err != nil {
 		return err
 	}
+	store, err := newFileAndroidDeliveryStore(filepath.Join(dataDir, "android-delivery"), limits.Count)
+	if err != nil {
+		return err
+	}
+	store.maxBytes = limits.QueueBytes
 	hub := newAndroidDeliveryHub(store)
+	hub.messageMaxBytes = limits.MessageBytes
 	hub.publicURL = strings.TrimRight(strings.TrimSpace(os.Getenv("BARK_PUBLIC_URL")), "/")
 	if hub.publicURL != "" {
 		if err := validateBarkPublicURL(hub.publicURL); err != nil {
@@ -158,6 +168,13 @@ func newAndroidDelivery(payload map[string]interface{}) androidDelivery {
 }
 
 func (h *androidDeliveryHub) deliver(deviceKey string, payload map[string]interface{}) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if len(raw) > h.messageMaxBytes {
+		return errAndroidMessageTooLarge
+	}
 	message := newAndroidDelivery(payload)
 	message.NotificationTag = androidNotificationTag(h.publicURL, message)
 	if err := h.store.update(deviceKey, func(box *androidDeviceOutbox) error {
@@ -389,7 +406,7 @@ func (h *androidDeliveryHub) flushMessage(ctx context.Context, key, deliveryID s
 		if message.DeliveryID != deliveryID {
 			continue
 		}
-		if message.FCMAccepted || message.FetchLeaseMillis > now.UnixMilli() || message.FCMBlocked || message.RetryAtMillis > now.UnixMilli() {
+		if message.Superseded || message.FCMAccepted || message.FetchLeaseMillis > now.UnixMilli() || message.FCMBlocked || message.RetryAtMillis > now.UnixMilli() {
 			return nil
 		}
 
@@ -400,7 +417,7 @@ func (h *androidDeliveryHub) flushMessage(ctx context.Context, key, deliveryID s
 				return h.store.update(key, func(current *androidDeviceOutbox) error {
 					for i := range current.Messages {
 						if current.Messages[i].DeliveryID == deliveryID {
-							current.Messages[i].FCMBlocked = true
+							current.Messages[i].Superseded = true
 						}
 					}
 					return nil

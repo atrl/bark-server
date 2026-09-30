@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -362,5 +363,114 @@ func TestDelayedFCMRetryCannotReplaceNewerAcceptedBusinessUpdate(t *testing.T) {
 	result := mustSync(t, hub, "key", 50)
 	if len(result.Messages) != 2 {
 		t.Fatal("superseded delivery removed without ACK")
+	}
+	if err := hub.ack("key", []string{result.Messages[1].DeliveryID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.setTransport("key", androidTransport{Provider: "fcm", Token: "rotated"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.flush(context.Background(), now.Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.calls) != 2 {
+		t.Fatal("token rotation revived a superseded notification")
+	}
+}
+
+func TestOutboxByteLimitsRejectWithoutDiscarding(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		var store androidDeliveryStore
+		memory := newMemoryAndroidDeliveryStore(100)
+		file, err := newFileAndroidDeliveryStore(t.TempDir(), 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persistent {
+			store = file
+		} else {
+			store = memory
+		}
+		hub := newAndroidDeliveryHub(store)
+		mustDeliver(t, hub, "key", map[string]interface{}{"body": "first"})
+		box, _ := store.read("key")
+		encoded, _ := json.Marshal(box)
+		memory.maxBytes = len(encoded) + 8
+		file.maxBytes = len(encoded) + 8
+		if err := hub.deliver("key", map[string]interface{}{"body": "second"}); !errors.Is(err, errAndroidQueueFull) {
+			t.Fatalf("want byte-capacity failure, got %v", err)
+		}
+		remaining, _ := store.read("key")
+		if len(remaining.Messages) != 1 || remaining.Messages[0].Payload["body"] != "first" {
+			t.Fatal("byte limit discarded prior message")
+		}
+	}
+	hub := isolateAndroidRoutes(t)
+	code, _ := androidTestRequest(t, "POST", "/push", "", `{"device_key":"one","body":"`+strings.Repeat("x", defaultAndroidMessageBytes)+`"}`)
+	if code != 413 {
+		t.Fatalf("oversized payload status %d", code)
+	}
+	if len(mustSync(t, hub, "one", 50).Messages) != 0 {
+		t.Fatal("oversized payload was persisted")
+	}
+}
+
+func TestOutboxLimitsConfigurationAndOversizedFile(t *testing.T) {
+	for _, name := range []string{"BARK_ANDROID_QUEUE_LIMIT", "BARK_ANDROID_QUEUE_MAX_BYTES", "BARK_ANDROID_MESSAGE_MAX_BYTES"} {
+		t.Setenv(name, "")
+	}
+	defaults, err := androidDeliveryLimitsFromEnvironment()
+	if err != nil || defaults.Count != 1024 || defaults.QueueBytes != 4*1024*1024 || defaults.MessageBytes != 32*1024 {
+		t.Fatalf("wrong defaults: %#v %v", defaults, err)
+	}
+	t.Setenv("BARK_ANDROID_QUEUE_LIMIT", "256")
+	t.Setenv("BARK_ANDROID_QUEUE_MAX_BYTES", "1048576")
+	configured, err := androidDeliveryLimitsFromEnvironment()
+	if err != nil || configured.Count != 256 || configured.QueueBytes != 1024*1024 {
+		t.Fatal("configured limits ignored")
+	}
+	t.Setenv("BARK_ANDROID_QUEUE_MAX_BYTES", "999999999")
+	if _, err := androidDeliveryLimitsFromEnvironment(); err == nil {
+		t.Fatal("unbounded queue bytes accepted")
+	}
+	store, _ := newFileAndroidDeliveryStore(t.TempDir(), 100)
+	path := store.queueFile("huge")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxAndroidOutboxFileBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if _, err := store.read("huge"); err == nil {
+		t.Fatal("oversized disk queue read without bound")
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() != maxAndroidOutboxFileBytes+1 {
+		t.Fatal("oversized file was deleted or truncated")
+	}
+}
+
+func BenchmarkAndroidOutboxReadNearDefaultCapacity(b *testing.B) {
+	store, err := newFileAndroidDeliveryStore(b.TempDir(), defaultAndroidQueueLimit)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := store.update("large", func(box *androidDeviceOutbox) error {
+		for i := 0; i < 120; i++ {
+			box.Messages = append(box.Messages, newAndroidDelivery(map[string]interface{}{"body": strings.Repeat("x", 32000)}))
+		}
+		return nil
+	}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(120 * 32000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := store.read("large"); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
