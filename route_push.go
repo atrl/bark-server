@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -264,6 +265,9 @@ func push(params map[string]interface{}) (int, error) {
 	msg.DeviceToken = deviceToken
 	if isAndroidDeviceToken(deviceToken) {
 		if err := deliverAndroidPush(&msg); err != nil {
+			if errors.Is(err, errAndroidQueueFull) {
+				return 503, err
+			}
 			return 500, fmt.Errorf("android push failed: %v", err)
 		}
 		return 200, nil

@@ -265,7 +265,7 @@ func TestBatchPush(t *testing.T) {
 func TestAndroidPushCanBePolled(t *testing.T) {
 	androidHub = newAndroidDeliveryHub()
 
-	registerBody := `{"device_key":"` + key + `","device_token":"android:emulator-1"}`
+	registerBody := `{"device_key":"` + key + `","device_token":"` + deviceToken + `"}`
 	req, _ := http.NewRequest("POST", "/register", bytes.NewBufferString(registerBody))
 	req.Host = "example.com"
 	req.Header.Set("Content-Type", "application/json")

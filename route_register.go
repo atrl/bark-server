@@ -55,11 +55,51 @@ func doRegister(c *fiber.Ctx, compat bool) error {
 		return c.Status(400).JSON(failed(400, "device token is invalid"))
 	}
 
+	// Existing Android keys are push addresses, not receive credentials. Knowing
+	// one must not permit replacing its installation token and reading its outbox.
+	lock := androidHub.deliveryLock(deviceInfo.DeviceKey)
+	lock.Lock()
+	defer lock.Unlock()
+	if deviceInfo.DeviceKey != "" {
+		existing, lookupErr := db.DeviceTokenByKey(deviceInfo.DeviceKey)
+		box, storageErr := androidHub.store.read(deviceInfo.DeviceKey)
+		if storageErr != nil {
+			return c.Status(500).JSON(failed(500, "unable to read Android registration state"))
+		}
+		if box.Revoked {
+			return c.Status(403).JSON(failed(403, "device key was revoked; register a new key"))
+		}
+		if lookupErr == nil && isAndroidDeviceToken(existing) && deviceInfo.DeviceToken != existing {
+			if !deviceTokensEqual(existing, c.Get("X-Bark-Device-Token")) {
+				return c.Status(403).JSON(failed(403, "existing Android installation token is required"))
+			}
+			if deviceInfo.DeviceToken != "deleted" && !isAndroidDeviceToken(deviceInfo.DeviceToken) {
+				return c.Status(409).JSON(failed(409, "register a new key when changing device platform"))
+			}
+			if err := androidHub.store.update(deviceInfo.DeviceKey, func(current *androidDeviceOutbox) error {
+				current.Transport = androidTransport{Provider: "poll"}
+				if deviceInfo.DeviceToken == "deleted" {
+					current.Messages = nil
+					current.Revoked = true
+				}
+				return nil
+			}); err != nil {
+				return c.Status(500).JSON(failed(500, "unable to revoke Android transport"))
+			}
+			if deviceInfo.DeviceToken == "deleted" {
+				if err := db.DeleteDeviceByKey(deviceInfo.DeviceKey); err != nil {
+					return c.Status(500).JSON(failed(500, "unable to delete Android device"))
+				}
+				return c.JSON(data(map[string]string{"key": deviceInfo.DeviceKey, "device_key": deviceInfo.DeviceKey, "device_token": "deleted"}))
+			}
+		}
+	}
+
 	// if deviceInfo.DeviceKey=="", newKey will be filled with a new uuid
 	// otherwise it equal to deviceInfo.DeviceKey
 	newKey, err := db.SaveDeviceTokenByKey(deviceInfo.DeviceKey, deviceInfo.DeviceToken)
 	if err != nil {
-		logger.Errorf("device registration failed: %v", err)
+		logger.Error("device registration failed")
 		return c.Status(500).JSON(failed(500, "device registration failed: %v", err))
 	}
 	deviceInfo.DeviceKey = newKey

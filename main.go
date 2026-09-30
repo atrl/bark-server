@@ -140,6 +140,7 @@ func setupGracefulShutdown(fiberApp *fiber.App) {
 			if err := fiberApp.Shutdown(); err != nil {
 				logger.Errorf("Server forced to shutdown error: %v", err)
 			}
+			androidHub.close()
 			if err := db.Close(); err != nil {
 				logger.Errorf("Database close error: %v", err)
 			}
@@ -320,7 +321,7 @@ func getAppFlags() []cli.Flag {
 			Name:    "write-timeout",
 			Usage:   "The maximum duration before timing out writes of the response",
 			EnvVars: []string{"BARK_SERVER_WRITE_TIMEOUT"},
-			Value:   3 * time.Second,
+			Value:   75 * time.Second,
 			Hidden:  true,
 		},
 		&cli.DurationFlag{

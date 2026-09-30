@@ -70,3 +70,119 @@ Just run the server with `-dsn=user:pass@tcp(mysql_host)/bark`, it will use MySQ
 * [API_V2.md](docs/API_V2.md).
 * [MCP.md](docs/MCP.md).
 
+## Android FCM and reliable delivery
+
+This fork keeps the existing Bark push API and adds optional Firebase Cloud
+Messaging HTTP v1 delivery. Build this fork's binary/image; upstream prebuilt Bark
+images do not contain these Android endpoints. Google Play publication is not
+required, but the phone needs working Google Play services and access to FCM.
+The NAS needs HTTPS access to `oauth2.googleapis.com` and `fcm.googleapis.com`.
+
+Configure these environment variables on the server:
+
+```sh
+BARK_FCM_PROJECT_ID=your-firebase-project-id
+GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase-service-account.json
+BARK_PUBLIC_URL=https://bark.example.com
+```
+
+`BARK_PUBLIC_URL` is the canonical external HTTPS URL, including any server URL
+prefix, without a trailing slash, credentials, query, or fragment. The Firebase
+service account JSON is a **server secret**: mount it read-only, restrict its file
+permissions, and never package it in the APK, container image, or Git repository.
+Enable the Firebase Cloud Messaging API and grant the account permission to send
+messages in that project. Android's `google-services.json` is a separate client
+configuration file, not the server private key. See Firebase's
+[HTTP v1 setup](https://firebase.google.com/docs/cloud-messaging/send/v1-api) and
+[Android setup](https://firebase.google.com/docs/cloud-messaging/android/get-started).
+
+All three variables are required for FCM. With incomplete configuration, FCM
+transport registration returns HTTP 503; reliable polling remains available.
+Invalid complete configuration fails startup rather than claiming FCM is ready.
+There is no test push or outbound send during configuration or transport
+registration unless an existing pending outbox message is ready for delivery.
+The `serverless` memory-only mode does not enable FCM or durable storage. For NAS
+operation, keep `/data` on a persistent local volume and run one server instance
+against it. Do not share the JSON outbox directory between multiple writers.
+
+### Device protocol
+
+First use the existing `/register` endpoint with an installation token
+`android:<random-installation-secret>`. The Bark device key is a send address;
+it is not sufficient to read messages or change the receiving installation.
+All endpoints below require `X-Bark-Device-Token` with the **full** installation
+token. When server Basic Auth is enabled, that authentication is also required.
+
+| Request | JSON body / response `data` |
+| --- | --- |
+| `POST /android/transport/:device_key` | Body: `{"provider":"fcm","token":"FCM-registration-token","notification_mode":"notification"}`. Response: `{"provider":"fcm","server_url":"https://bark.example.com"}`. |
+| `POST /android/transport/:device_key` | Body: `{"provider":"poll"}` clears the FCM binding and selects reliable polling. |
+| `GET /android/sync/:device_key?timeout=30&limit=50` | `{"messages":[{"delivery_id":"UUID","payload":{},"created_at_millis":0,"fcm_accepted":false,"notification_tag":"bark:..."}],"more":false}`. Timeout is 0–60 seconds; limit is 1–100. An empty result is HTTP 200 with an empty messages array. |
+| `POST /android/ack/:device_key` | Body: `{"delivery_ids":["UUID"]}`. Idempotent HTTP 200, including already acknowledged or unknown IDs. At most 100 IDs per request. |
+
+Responses retain the existing `CommonResp` envelope (`code`, `message`, `data`,
+`timestamp`). Persist each received delivery in the client inbox before ACK;
+identify retries with `delivery_id`, which is independent from Bark's optional
+business `id`. Updates and deletions may share a business ID while remaining
+separate deliveries. ACKs can remove messages only from the authenticated device.
+
+`notification_tag` is an opaque, stable notification identity generated from the
+canonical server URL, device key, and business ID (or delivery ID if absent), using
+SHA-256. Both the sync response and the FCM data include this value; FCM also
+includes `bark_delivery_id`, `bark_server_url`, and the compatible
+`bark_notification_tag`. Use the supplied tag with Android notification ID `0`
+for local rendering, replacement, and deletion. FCM uses the `bark_default`
+notification channel, which the Android app must create before registration.
+
+Re-registering an existing Android key with the same installation token is safe
+to retry. Replacing its token or unregistering with `device_token=deleted` requires
+the old `X-Bark-Device-Token`. Unregistration clears pending deliveries, unbinds
+FCM, deletes the device mapping, and prevents reuse of the revoked key. Changing
+from Android to a different platform requires a new key. None of these receive
+credentials or the Bark device key are included in the FCM data payload or request
+logs; logs contain route templates rather than URLs or request bodies.
+
+### Persistence, retries, and display limits
+
+Pending messages and transport bindings are saved under `/data/android-delivery`
+using synced temporary files and atomic replacement. Old payload-only queues are
+migrated on their next mutation. A successful push means **stored by Bark**, and
+`fcm_accepted=true` means **accepted by Google**, not displayed on the phone.
+Sync does not delete a message. Only authenticated ACK, authorized device deletion,
+or the explicitly legacy destructive poll API can remove it.
+
+Each device has a 1,024-message pending limit. A full outbox rejects a new push
+with HTTP 503 and retains all earlier messages. Transient FCM failures are retried
+with exponential delay (1 minute up to 64 minutes), honoring a longer
+`Retry-After`. Unregistered FCM tokens are cleared; messages remain available for
+sync. Registering a replacement token unblocks pending deliveries. Provider
+acceptance stops FCM retransmission while the outbox still awaits client ACK.
+A sync read defers competing FCM delivery once for two minutes, allowing client
+persistence and ACK; repeated reads do not extend this lease. A lost sync response
+therefore leaves the delivery recoverable and eventually eligible for FCM again.
+As with other networked queues, a lost provider response can cause a retry after
+Google accepted it. Stable notification tags and client delivery IDs provide
+deduplication; this is not an exactly-once display guarantee.
+
+Ordinary messages use notification plus minimal data so Android/Google Play
+services can show them without a Bark process. Encrypted messages expose only a
+generic “收到加密消息” notification to FCM; ciphertext, IV, and fallback body/title
+stay in the authenticated outbox. The client can request
+`notification_mode="data"` to enforce local decryption or active group-mute
+settings. Delete, call, autocopy, custom sound, action, volume, and explicit TTL
+messages also use data-only delivery because their semantics require app code.
+Data-only delivery and local rendering remain subject to Android background
+execution restrictions. A force-stopped app must be opened manually to resume
+receiving. Notification permission, device connectivity, expired Google messages,
+and notification dismissal can all separate provider acceptance from actual
+visibility; clients should use local display/click evidence for notification
+deduplication rather than treating acceptance as proof of display. See Firebase's
+[receive behavior](https://firebase.google.com/docs/cloud-messaging/android/receive-messages).
+
+`GET /android/poll/:device_key` remains available only for old registrations that
+have not used the new transport/sync protocol. Its historical consume-on-read
+semantics cannot protect against a lost response. After a successful transport
+registration or first sync, it returns HTTP 409 and cannot bypass ACK. Upgrade
+clients to `/sync` even when Firebase is not configured. The default server write
+timeout is 75 seconds so a 60-second long poll can complete; reverse proxies should
+allow at least this duration and avoid caching these authenticated endpoints.

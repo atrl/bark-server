@@ -1,9 +1,8 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,23 +11,78 @@ import (
 	"time"
 
 	"github.com/finb/bark-server/v2/apns"
+	"github.com/google/uuid"
+	"github.com/mritd/logger"
 )
 
 const androidDeviceTokenPrefix = "android:"
-const defaultAndroidQueueLimit = 64
+const defaultAndroidQueueLimit = 1024
 const defaultApnsSound = "1107"
 
+var errAndroidQueueFull = errors.New("android outbox is full; receive and acknowledge pending messages before retrying")
+var errAndroidUnauthorized = errors.New("invalid Android device credentials")
+var errAndroidReliableTransport = errors.New("device uses reliable delivery; use authenticated sync and ack")
 var androidHub = newAndroidDeliveryHub()
+
+// Delivery IDs identify deliveries, not the caller's replace/delete notification ID.
+type androidDelivery struct {
+	DeliveryID       string                 `json:"delivery_id"`
+	Payload          map[string]interface{} `json:"payload"`
+	CreatedAtMillis  int64                  `json:"created_at_millis"`
+	FCMAccepted      bool                   `json:"fcm_accepted"`
+	NotificationTag  string                 `json:"notification_tag"`
+	FetchLeaseMillis int64                  `json:"fetch_lease_millis,omitempty"`
+	Attempts         int                    `json:"attempts,omitempty"`
+	RetryAtMillis    int64                  `json:"retry_at_millis,omitempty"`
+	FCMBlocked       bool                   `json:"fcm_blocked,omitempty"`
+	NotificationMode string                 `json:"-"`
+}
+
+type androidSyncMessage struct {
+	DeliveryID      string                 `json:"delivery_id"`
+	Payload         map[string]interface{} `json:"payload"`
+	CreatedAtMillis int64                  `json:"created_at_millis"`
+	FCMAccepted     bool                   `json:"fcm_accepted"`
+	NotificationTag string                 `json:"notification_tag"`
+}
+
+type androidSyncResult struct {
+	Messages []androidSyncMessage `json:"messages"`
+	More     bool                 `json:"more"`
+}
+
+type androidTransport struct {
+	Provider         string `json:"provider"`
+	Token            string `json:"token,omitempty"`
+	NotificationMode string `json:"notification_mode,omitempty"`
+}
+
+type androidDeviceOutbox struct {
+	Version   int               `json:"version"`
+	Revoked   bool              `json:"revoked,omitempty"`
+	DeviceKey string            `json:"device_key"`
+	Transport androidTransport  `json:"transport"`
+	Messages  []androidDelivery `json:"messages"`
+}
+
+type androidDeliveryStore interface {
+	read(deviceKey string) (androidDeviceOutbox, error)
+	update(deviceKey string, change func(*androidDeviceOutbox) error) error
+	deviceKeys() ([]string, error)
+}
 
 type androidDeliveryHub struct {
 	store   androidDeliveryStore
 	mu      sync.Mutex
 	signals map[string]chan struct{}
-}
-
-type androidDeliveryStore interface {
-	append(deviceKey string, payload map[string]interface{}) error
-	pop(deviceKey string) (map[string]interface{}, bool, error)
+	// Serialize fetching with sending. A short fetch lease prevents sending while
+	// the client persists/ACKs; a lost sync response cannot disable FCM forever.
+	deliveryLocks map[string]*sync.Mutex
+	publicURL     string
+	sender        androidFCMSender
+	wake          chan struct{}
+	cancel        context.CancelFunc
+	done          chan struct{}
 }
 
 func newAndroidDeliveryHub(stores ...androidDeliveryStore) *androidDeliveryHub {
@@ -36,10 +90,7 @@ func newAndroidDeliveryHub(stores ...androidDeliveryStore) *androidDeliveryHub {
 	if len(stores) > 0 && stores[0] != nil {
 		store = stores[0]
 	}
-	return &androidDeliveryHub{
-		store:   store,
-		signals: make(map[string]chan struct{}),
-	}
+	return &androidDeliveryHub{store: store, signals: make(map[string]chan struct{}), wake: make(chan struct{}, 1), deliveryLocks: make(map[string]*sync.Mutex)}
 }
 
 func isAndroidDeviceToken(token string) bool {
@@ -62,7 +113,21 @@ func initializeAndroidDelivery(dataDir string) error {
 	if err != nil {
 		return err
 	}
-	androidHub = newAndroidDeliveryHub(store)
+	hub := newAndroidDeliveryHub(store)
+	hub.publicURL = strings.TrimRight(strings.TrimSpace(os.Getenv("BARK_PUBLIC_URL")), "/")
+	if hub.publicURL != "" {
+		if err := validateBarkPublicURL(hub.publicURL); err != nil {
+			return err
+		}
+	}
+	hub.sender, err = newFCMSenderFromEnvironment()
+	if err != nil {
+		return fmt.Errorf("invalid FCM configuration: %w", err)
+	}
+	androidHub = hub
+	if hub.sender != nil {
+		hub.start()
+	}
 	return nil
 }
 
@@ -77,190 +142,301 @@ func (h *androidDeliveryHub) signal(deviceKey string) chan struct{} {
 	return ch
 }
 
-func (h *androidDeliveryHub) deliver(deviceKey string, payload map[string]interface{}) error {
-	if err := h.store.append(deviceKey, payload); err != nil {
-		return err
-	}
-	ch := h.signal(deviceKey)
+func (h *androidDeliveryHub) notify(deviceKey string) {
 	select {
-	case ch <- struct{}{}:
+	case h.signal(deviceKey) <- struct{}{}:
 	default:
 	}
+	select {
+	case h.wake <- struct{}{}:
+	default:
+	}
+}
+
+func newAndroidDelivery(payload map[string]interface{}) androidDelivery {
+	return androidDelivery{DeliveryID: uuid.NewString(), Payload: payload, CreatedAtMillis: time.Now().UnixMilli()}
+}
+
+func (h *androidDeliveryHub) deliver(deviceKey string, payload map[string]interface{}) error {
+	message := newAndroidDelivery(payload)
+	message.NotificationTag = androidNotificationTag(h.publicURL, message)
+	if err := h.store.update(deviceKey, func(box *androidDeviceOutbox) error {
+		if box.Revoked {
+			return fmt.Errorf("Android device was revoked")
+		}
+		box.Messages = append(box.Messages, message)
+		return nil
+	}); err != nil {
+		return err
+	}
+	h.notify(deviceKey)
 	return nil
+}
+
+// Old poll remains destructive for clients without ACK. Registering either new
+// transport prevents this endpoint from bypassing reliable outbox semantics.
+func (h *androidDeliveryHub) popLegacy(deviceKey string) (map[string]interface{}, bool, error) {
+	var payload map[string]interface{}
+	err := h.store.update(deviceKey, func(box *androidDeviceOutbox) error {
+		if box.Transport.Provider != "" {
+			return errAndroidReliableTransport
+		}
+		if len(box.Messages) > 0 {
+			payload = box.Messages[0].Payload
+			box.Messages = box.Messages[1:]
+		}
+		return nil
+	})
+	return payload, payload != nil && err == nil, err
 }
 
 func (h *androidDeliveryHub) poll(deviceKey string, timeout time.Duration) (map[string]interface{}, bool) {
-	if payload, ok, err := h.store.pop(deviceKey); err == nil && ok {
-		return payload, true
-	}
 	ch := h.signal(deviceKey)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case <-ch:
-		payload, ok, err := h.store.pop(deviceKey)
-		return payload, err == nil && ok
-	case <-timer.C:
-		return nil, false
-	}
-}
-
-func androidPayloadFromPushMessage(msg *apns.PushMessage) map[string]interface{} {
-	payload := make(map[string]interface{}, len(msg.ExtParams)+6)
-	if msg.Id != "" {
-		payload["id"] = msg.Id
-	}
-	payload["device_key"] = msg.DeviceKey
-	if msg.Title != "" {
-		payload["title"] = msg.Title
-	}
-	if msg.Subtitle != "" {
-		payload["subtitle"] = msg.Subtitle
-	}
-	if msg.Body != "" {
-		payload["body"] = msg.Body
-	}
-	if msg.Sound != "" && msg.Sound != defaultApnsSound {
-		payload["sound"] = msg.Sound
-	}
-	for k, v := range msg.ExtParams {
-		key := strings.ToLower(k)
-		if isAndroidCanonicalPayloadKey(key, payload) {
-			continue
+	for {
+		payload, ok, err := h.popLegacy(deviceKey)
+		if err != nil || ok {
+			return payload, ok
 		}
-		payload[key] = fmt.Sprintf("%v", v)
-	}
-	return payload
-}
-
-func isAndroidCanonicalPayloadKey(key string, payload map[string]interface{}) bool {
-	switch key {
-	case "id":
-		_, exists := payload[key]
-		return exists
-	case "device_key", "title", "subtitle", "body", "sound":
-		return true
-	default:
-		return false
+		select {
+		case <-ch:
+		case <-timer.C:
+			return nil, false
+		}
 	}
 }
 
-type memoryAndroidDeliveryStore struct {
-	limit  int
-	mu     sync.Mutex
-	queues map[string][]map[string]interface{}
-}
-
-func newMemoryAndroidDeliveryStore(limit int) *memoryAndroidDeliveryStore {
-	return &memoryAndroidDeliveryStore{
-		limit:  limit,
-		queues: make(map[string][]map[string]interface{}),
+func (h *androidDeliveryHub) setTransport(deviceKey string, transport androidTransport, credentials ...string) error {
+	lock := h.deliveryLock(deviceKey)
+	lock.Lock()
+	defer lock.Unlock()
+	if !validAndroidCredentials(deviceKey, credentials) {
+		return errAndroidUnauthorized
 	}
-}
-
-func (s *memoryAndroidDeliveryStore) append(deviceKey string, payload map[string]interface{}) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	queue := append(s.queues[deviceKey], payload)
-	if s.limit > 0 && len(queue) > s.limit {
-		queue = queue[len(queue)-s.limit:]
+	if err := h.store.update(deviceKey, func(box *androidDeviceOutbox) error {
+		changed := box.Transport != transport
+		box.Transport = transport
+		if changed {
+			for i := range box.Messages {
+				box.Messages[i].FCMBlocked = false
+				box.Messages[i].RetryAtMillis = 0
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	s.queues[deviceKey] = queue
+	h.notify(deviceKey)
 	return nil
 }
 
-func (s *memoryAndroidDeliveryStore) pop(deviceKey string) (map[string]interface{}, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	queue := s.queues[deviceKey]
-	if len(queue) == 0 {
-		return nil, false, nil
+func (h *androidDeliveryHub) fetch(deviceKey string, limit int, credentials ...string) (androidSyncResult, error) {
+	lock := h.deliveryLock(deviceKey)
+	lock.Lock()
+	defer lock.Unlock()
+	if !validAndroidCredentials(deviceKey, credentials) {
+		return androidSyncResult{}, errAndroidUnauthorized
 	}
-	payload := queue[0]
-	if len(queue) == 1 {
-		delete(s.queues, deviceKey)
-	} else {
-		s.queues[deviceKey] = queue[1:]
-	}
-	return payload, true, nil
-}
-
-type fileAndroidDeliveryStore struct {
-	dir   string
-	limit int
-	mu    sync.Mutex
-}
-
-func newFileAndroidDeliveryStore(dir string, limit int) (*fileAndroidDeliveryStore, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
-	}
-	return &fileAndroidDeliveryStore{dir: dir, limit: limit}, nil
-}
-
-func (s *fileAndroidDeliveryStore) append(deviceKey string, payload map[string]interface{}) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	queue, err := s.readQueue(deviceKey)
-	if err != nil {
-		return err
-	}
-	queue = append(queue, payload)
-	if s.limit > 0 && len(queue) > s.limit {
-		queue = queue[len(queue)-s.limit:]
-	}
-	return s.writeQueue(deviceKey, queue)
-}
-
-func (s *fileAndroidDeliveryStore) pop(deviceKey string) (map[string]interface{}, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	queue, err := s.readQueue(deviceKey)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(queue) == 0 {
-		return nil, false, nil
-	}
-	payload := queue[0]
-	return payload, true, s.writeQueue(deviceKey, queue[1:])
-}
-
-func (s *fileAndroidDeliveryStore) readQueue(deviceKey string) ([]map[string]interface{}, error) {
-	data, err := os.ReadFile(s.queueFile(deviceKey))
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var queue []map[string]interface{}
-	if err := json.Unmarshal(data, &queue); err != nil {
-		return nil, err
-	}
-	return queue, nil
-}
-
-func (s *fileAndroidDeliveryStore) writeQueue(deviceKey string, queue []map[string]interface{}) error {
-	path := s.queueFile(deviceKey)
-	if len(queue) == 0 {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
+	result := androidSyncResult{Messages: []androidSyncMessage{}}
+	err := h.store.update(deviceKey, func(box *androidDeviceOutbox) error {
+		// A successful sync upgrades old registrations to ACK semantics too.
+		if box.Transport.Provider == "" {
+			box.Transport.Provider = "poll"
+		}
+		result.More = len(box.Messages) > limit
+		for i := 0; i < len(box.Messages) && i < limit; i++ {
+			msg := &box.Messages[i]
+			if msg.FetchLeaseMillis == 0 {
+				msg.FetchLeaseMillis = time.Now().Add(2 * time.Minute).UnixMilli()
+			}
+			if msg.NotificationTag == "" {
+				msg.NotificationTag = androidNotificationTag(h.publicURL, *msg)
+			}
+			result.Messages = append(result.Messages, androidSyncMessage{msg.DeliveryID, msg.Payload, msg.CreatedAtMillis, msg.FCMAccepted, msg.NotificationTag})
 		}
 		return nil
+	})
+	return result, err
+}
+
+func (h *androidDeliveryHub) syncMessages(deviceKey string, timeout time.Duration, limit int, credentials ...string) (androidSyncResult, error) {
+	ch := h.signal(deviceKey)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		result, err := h.fetch(deviceKey, limit, credentials...)
+		if err != nil || len(result.Messages) > 0 || timeout <= 0 {
+			return result, err
+		}
+		select {
+		case <-ch:
+		case <-timer.C:
+			return result, nil
+		}
 	}
-	data, err := json.Marshal(queue)
+}
+
+func (h *androidDeliveryHub) ack(deviceKey string, ids []string, credentials ...string) error {
+	lock := h.deliveryLock(deviceKey)
+	lock.Lock()
+	defer lock.Unlock()
+	if !validAndroidCredentials(deviceKey, credentials) {
+		return errAndroidUnauthorized
+	}
+	acknowledged := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		acknowledged[id] = true
+	}
+	return h.store.update(deviceKey, func(box *androidDeviceOutbox) error {
+		remaining := make([]androidDelivery, 0, len(box.Messages))
+		for _, message := range box.Messages {
+			if !acknowledged[message.DeliveryID] {
+				remaining = append(remaining, message)
+			}
+		}
+		box.Messages = remaining
+		return nil
+	})
+}
+
+func (h *androidDeliveryHub) start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel, h.done = cancel, make(chan struct{})
+	go func() {
+		defer close(h.done)
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			if err := h.flush(ctx, time.Now()); err != nil && ctx.Err() == nil {
+				logger.Error("Android FCM outbox storage operation failed; pending messages retained")
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.wake:
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (h *androidDeliveryHub) close() {
+	if h.cancel != nil {
+		h.cancel()
+		<-h.done
+	}
+}
+
+func (h *androidDeliveryHub) flush(ctx context.Context, now time.Time) error {
+	if h.sender == nil {
+		return nil
+	}
+	keys, err := h.store.deviceKeys()
 	if err != nil {
 		return err
 	}
-	tempPath := path + ".tmp"
-	if err := os.WriteFile(tempPath, data, 0600); err != nil {
-		return err
+	for _, key := range keys {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := h.flushDevice(ctx, key, now); err != nil {
+			return err
+		}
 	}
-	return os.Rename(tempPath, path)
+	return nil
 }
 
-func (s *fileAndroidDeliveryStore) queueFile(deviceKey string) string {
-	sum := sha256.Sum256([]byte(deviceKey))
-	return filepath.Join(s.dir, hex.EncodeToString(sum[:])+".json")
+func (h *androidDeliveryHub) deliveryLock(key string) *sync.Mutex {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if lock := h.deliveryLocks[key]; lock != nil {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	h.deliveryLocks[key] = lock
+	return lock
+}
+
+func (h *androidDeliveryHub) flushDevice(ctx context.Context, key string, now time.Time) error {
+	box, err := h.store.read(key)
+	if err != nil {
+		return err
+	}
+	for _, message := range box.Messages {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := h.flushMessage(ctx, key, message.DeliveryID, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *androidDeliveryHub) flushMessage(ctx context.Context, key, deliveryID string, now time.Time) error {
+	lock := h.deliveryLock(key)
+	lock.Lock()
+	defer lock.Unlock()
+	box, err := h.store.read(key)
+	if err != nil {
+		return err
+	}
+	if box.Transport.Provider != "fcm" || box.Transport.Token == "" {
+		return nil
+	}
+	for index, message := range box.Messages {
+		if message.DeliveryID != deliveryID {
+			continue
+		}
+		if message.FCMAccepted || message.FetchLeaseMillis > now.UnixMilli() || message.FCMBlocked || message.RetryAtMillis > now.UnixMilli() {
+			return nil
+		}
+
+		// Do not let a delayed retry overwrite a newer accepted update/delete that
+		// uses the same business notification ID. Keep the old event for sync/ACK.
+		for _, newer := range box.Messages[index+1:] {
+			if newer.FCMAccepted && newer.NotificationTag == message.NotificationTag && message.NotificationTag != "" {
+				return h.store.update(key, func(current *androidDeviceOutbox) error {
+					for i := range current.Messages {
+						if current.Messages[i].DeliveryID == deliveryID {
+							current.Messages[i].FCMBlocked = true
+						}
+					}
+					return nil
+				})
+			}
+		}
+		message.NotificationMode = box.Transport.NotificationMode
+		result := h.sender.send(ctx, box.Transport.Token, message)
+		return h.store.update(key, func(current *androidDeviceOutbox) error {
+			for i := range current.Messages {
+				if current.Messages[i].DeliveryID != deliveryID {
+					continue
+				}
+				item := &current.Messages[i]
+				item.Attempts++
+				item.FCMAccepted = result.Accepted
+				item.FCMBlocked = !result.Accepted && !result.Retryable
+				backoff := time.Minute * time.Duration(1<<min(item.Attempts-1, 6))
+				if result.RetryAfter > backoff {
+					backoff = result.RetryAfter
+				}
+				item.RetryAtMillis = now.Add(backoff).UnixMilli()
+			}
+			if result.InvalidToken {
+				current.Transport.Token = ""
+			}
+			return nil
+		})
+	}
+	return nil
+}
+
+func validAndroidCredentials(key string, credentials []string) bool {
+	if len(credentials) == 0 {
+		return true
+	} // Internal helpers and unit tests.
+	token, err := db.DeviceTokenByKey(key)
+	return err == nil && isAndroidDeviceToken(token) && deviceTokensEqual(token, credentials[0])
 }
