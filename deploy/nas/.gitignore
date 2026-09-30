@@ -3,3 +3,7 @@ data/
 secrets/
 cloudflare/
 egress/
+apk-releases/
+release-tools/
+__pycache__/
+*.pyc

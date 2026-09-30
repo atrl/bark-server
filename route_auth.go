@@ -21,6 +21,9 @@ func routerAuth(user, passwd string, router fiber.Router, urlPrefix string) {
 		Users: map[string]string{user: passwd},
 		Realm: "Coffee Time",
 		Unauthorized: func(c *fiber.Ctx) error {
+			if (c.Method() == fiber.MethodGet || c.Method() == fiber.MethodHead) && strings.HasPrefix(c.Path(), path.Join(urlPrefix, "/android/releases")+"/") {
+				return c.Next()
+			}
 			for _, item := range authFreeRouters {
 				if strings.HasPrefix(c.Path(), path.Join(urlPrefix, item)) {
 					return c.Next()

@@ -17,6 +17,7 @@ services:
     environment:
       BARK_SERVER_ADDRESS: 127.0.0.1:18083
       BARK_SERVER_DATA_DIR: /data
+      BARK_ANDROID_RELEASES_DIR: /releases
       BARK_PUBLIC_URL: ${BARK_PUBLIC_URL:?Set the public HTTPS URL}
       BARK_FCM_PROJECT_ID: ${BARK_FCM_PROJECT_ID:-}
       GOOGLE_APPLICATION_CREDENTIALS: ${BARK_FCM_CREDENTIALS_PATH:-}
@@ -28,6 +29,7 @@ services:
     volumes:
       - ./data:/data
       - ./secrets:/run/secrets:ro
+      - ./apk-releases:/releases:ro
     healthcheck:
       test: [CMD, wget, -q, --spider, http://127.0.0.1:18083/healthz]
       interval: 30s
@@ -80,6 +82,36 @@ services:
     command: [-d, /config]
     volumes:
       - ./egress:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
+
+  release-sync:
+    image: python:3.12-slim
+    container_name: bark-release-sync
+    restart: always
+    network_mode: host
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpu_shares: 128
+    pids_limit: 64
+    tmpfs:
+      - /tmp:size=16m,uid=65532,gid=65532,mode=0700
+    environment:
+      HTTPS_PROXY: ${BARK_RELEASE_HTTPS_PROXY:-http://127.0.0.1:17890}
+      NO_PROXY: localhost,127.0.0.1
+      TMPDIR: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    command: [python, /opt/bark-release/sync-android-release.py, --release-dir, /releases, --interval, "1800"]
+    volumes:
+      - ./release-tools:/opt/bark-release:ro
+      - ./apk-releases:/releases
     logging:
       driver: json-file
       options:
