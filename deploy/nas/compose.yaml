@@ -66,28 +66,6 @@ services:
         max-size: 5m
         max-file: "3"
 
-  egress:
-    # Optional NAS-only outbound route for Google's FCM and OAuth endpoints.
-    profiles: [google-egress]
-    image: dreamacro/clash-premium@sha256:4026803353b7c0341366225db3398cf803efba21488180211ec65ad588ce5933
-    container_name: bark-egress
-    restart: always
-    network_mode: host
-    user: "65532:65532"
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 128m
-    cpu_shares: 128
-    command: [-d, /config]
-    volumes:
-      - ./egress:/config
-    logging:
-      driver: json-file
-      options:
-        max-size: 5m
-        max-file: "3"
-
   release-sync:
     image: python:3.12-slim
     container_name: bark-release-sync
@@ -103,7 +81,7 @@ services:
     tmpfs:
       - /tmp:size=16m,uid=65532,gid=65532,mode=0700
     environment:
-      HTTPS_PROXY: ${BARK_RELEASE_HTTPS_PROXY:-http://127.0.0.1:17890}
+      HTTPS_PROXY: ${BARK_RELEASE_HTTPS_PROXY:-http://127.0.0.1:7890}
       NO_PROXY: localhost,127.0.0.1
       TMPDIR: /tmp
       PYTHONDONTWRITEBYTECODE: "1"

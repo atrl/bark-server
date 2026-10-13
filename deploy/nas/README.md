@@ -51,16 +51,18 @@ existing proxy, set `BARK_HTTPS_PROXY` and verify certificate validation remains
 enabled. Cloudflare Tunnel exposes the inbound API; it does not carry the
 phone's outbound connection to Google Play services.
 
-An optional `google-egress` Compose profile provides a dedicated loopback proxy
-at port 17890. Provision its private `egress/config.yaml` from an authorized,
-working proxy configuration. Limit routes to `fcm.googleapis.com`,
-`oauth2.googleapis.com`, and `accounts.google.com`, reject other destinations,
-and keep TLS certificate verification enabled for both the proxy node and
-Google HTTPS. Keep the directory owned by `65532:65532` with mode `0700` and its
-configuration `0600`; it contains credentials and must never enter Git. Start
-with `docker compose --profile google-egress up -d` and set
-`BARK_HTTPS_PROXY=http://127.0.0.1:17890`. Recheck its health if credentials expire.
-The existing NAS-wide proxy configuration is independent of this container.
+Use the existing NAS main Clash HTTP listener at `127.0.0.1:7890` for both
+`BARK_HTTPS_PROXY` and `BARK_RELEASE_HTTPS_PROXY`. The Compose stack does not
+create a separate proxy container or manage proxy-node credentials. Maintain
+subscriptions and node failover in the main Clash configuration. Before switching,
+verify HTTPS access to `fcm.googleapis.com`, `oauth2.googleapis.com`,
+`accounts.google.com`, and the GitHub release endpoints listed below. Keep TLS
+certificate verification enabled. A reachable FCM endpoint does not prove phone
+delivery; verify that separately when an actual test notification is authorized.
+
+Proxy environment variables apply to the server and release-sync processes.
+They do not automatically route the Cloudflare connector's edge traffic; manage
+that transport separately in the NAS tunnel egress configuration.
 
 Synology kernels can lack CPU quota and PIDs controllers. This file uses CPU
 shares rather than hard CPU quotas; PID limits may be ignored on those kernels.
@@ -153,13 +155,12 @@ sets `BARK_ANDROID_RELEASES_DIR=/releases`. The separate `release-sync` containe
 runs Python 3.12 every 30 minutes and reads only the public stable release at
 `https://api.github.com/repos/atrl/bark-android/releases/latest`. It mounts only
 `./release-tools` (read-only) and `./apk-releases` (read-write), with no notification
-data, signing keys, or Firebase secret mounts. It uses the dedicated outbound proxy
-in `BARK_RELEASE_HTTPS_PROXY`, separately from the server's FCM proxy setting.
-Allow only `api.github.com`, `github.com`, `objects.githubusercontent.com`,
-`release-assets.githubusercontent.com`, and `github-releases.githubusercontent.com`
-for release downloads, plus the existing Google FCM/OAuth hosts, on that dedicated
-proxy. This is not a general-purpose outbound proxy; other destinations remain
-rejected and certificate validation stays enabled.
+data, signing keys, or Firebase secret mounts. It uses the shared NAS main Clash
+proxy through `BARK_RELEASE_HTTPS_PROXY`, which can be overridden independently
+of the server's FCM proxy setting. Ensure that proxy can reach `api.github.com`,
+`github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
+and `github-releases.githubusercontent.com`. Certificate validation and the
+mirror's own download/redirect host allowlist remain enabled.
 
 The mirror downloads into `/releases/.sync-*` on NAS disk, not memory-backed
 `/tmp`. It validates every redirect destination, bounded download length, release
